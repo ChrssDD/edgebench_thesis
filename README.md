@@ -34,7 +34,7 @@ Der grundlegende Ablauf ist:
 
 ```bash
 # Repository klonen
-git clone <repo-url>
+git clone https://github.com/ChrssDD/edgebench_thesis
 cd edgebench
 
 # Virtuelle Umgebung erstellen und aktivieren
