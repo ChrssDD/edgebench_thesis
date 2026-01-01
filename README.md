@@ -1,330 +1,203 @@
+# EdgeBench
 
-# Methodik und Messprotokoll (EdgeBench)
+Benchmark-Repo zum Vergleich der Abfrageperformance von SQLite und DuckDB für typische Zeitreihen-Analytik auf Edge-Hardware (z. B. Raspberry Pi).
 
-Dieses Dokument definiert das Messverfahren, mit dem die Abfrageperformance von SQLite und DuckDB auf einem ressourcenbeschränkten Edge-Knoten reproduzierbar verglichen wird. Es beschreibt (i) Fairness- und Vergleichsregeln, (ii) Datenbasis, (iii) Workloads und Query-Semantik, (iv) Messablauf und Kennzahlen sowie (v) Logging, Reproduzierbarkeit und Validitätsrisiken.
+## Workflow
 
----
+Der grundlegende Ablauf ist:
+1. Daten generieren
+2. Datenbanken laden
+3. Queries messen
+4. Ergebnisse als JSON speichern
+5. Auswertung und Plots erzeugen
 
-## 1 Ziel und Vergleichsregeln
+## Repository-Übersicht
 
-### 1.1 Untersuchungsziel
-Verglichen wird die Latenz typischer Zeitreihen-Analytik-Queries aus der Gebäude- und Prozessautomatisierung auf einem Edge-Gerät. Der Fokus liegt auf Abfragezeiten unter verschiedenen Datenmengen, Tag-Anzahlen, Cache-Zuständen und Ressourcenprofilen.
+- **config.py** – Zentrale Pfade (EDGE_ROOT sowie data/db/results/logs und Queries-Pfad)
+- **generator/synth.py** – Deterministisches Erzeugen synthetischer Zeitreihen als CSV und Parquet
+- **loader/sqlite_loader.py** – CSV nach SQLite (WAL/NORMAL, optionaler Extra-Index)
+- **loader/duckdb_loader.py** – Parquet nach DuckDB (Tabelle measurements)
+- **runner/run_bench.py** – Single-Benchmarks (eine Query mehrfach ausführen und JSON-Result schreiben)
+- **runner/run_matrix.py** – Orchestrieren kompletter Experiment-Matrizen
+- **queries/** – Engine-spezifische SQL-Dateien (queries/sqlite/*.sql und queries/duckdb/*.sql)
+- **analysis/** – Auswertung (Summary, Break-even, Plots)
 
-### 1.2 Fairnessprinzipien
-Der Vergleich gilt nur dann als interpretierbar, wenn folgende Regeln eingehalten werden:
+## Voraussetzungen
 
-1. **Semantische Äquivalenz**  
-   SQLite und DuckDB müssen für jede Query inhaltlich gleiche Ergebnisse liefern (innerhalb definierter Toleranzen bei Gleitkommawerten). “Gleiches Problem” bedeutet gleiches Ergebnis auf gleicher Datenbasis, nicht identischer SQL-Text.
+- **OS:** Linux wird empfohlen (Debian/Raspberry Pi passt gut)
+- **Python:** 3.10 oder neuer
+- **Pakete:** numpy, pandas, duckdb, pyarrow, psutil, matplotlib
+- **Optional:** Root-Zugriff für echte Cold-Runs (Linux Page Cache droppen via /proc/sys/vm/drop_caches)
+- **Optional:** PSI-Metriken (erfordern /proc/pressure/* im Kernel)
 
-2. **Konstante physische Randbedingungen**  
-   Gleiche Hardware, gleiche Storage-Anbindung, gleiche OS- und Kernel-Version, gleiche Datendateien, identische Tag-Anzahlen und Datenraten pro Messzelle.
+## Installation
 
-3. **Isolierter Messpfad**  
-   Pro Iteration wird genau die Query-Latenz gemessen. Setup- und Validierungsschritte werden außerhalb der Zeitmessung durchgeführt und separat geloggt.
+```bash
+# Repository klonen
+git clone <repo-url>
+cd edgebench
 
-4. **Cache-Regime als kontrollierter Faktor**  
-   Warm- und Cold-Szenarien sind getrennte Versuchsbedingungen. Im Cold-Fall wird der Cachezustand vor jeder Iteration aktiv zurückgesetzt (oder alternativ vor jedem Block, wenn blockweise Kälte definiert ist). Warm-Fall bedeutet stabiler Page-Cache ohne Drops.
+# Virtuelle Umgebung erstellen und aktivieren
+python3.10 -m venv venv
+source venv/bin/activate  # Linux/macOS
+# oder
+venv\Scripts\activate  # Windows
 
-5. **Engine-spezifische Konfigurationen sind offen gelegt**  
-   SQLite: Journaling-Mode, Synchronisation, Indizes.  
-   DuckDB: Threads-Modus, Table-Scan vs Import.  
-   Alles, was die Latenz beeinflusst, wird versioniert und im Ergebnisartefakt dokumentiert.
+# Abhängigkeiten installieren
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
----
+**Hinweis:** Für `python -m` Aufrufe müssen die Ordner als Packages importierbar sein (mit `__init__.py`) und du musst im Repo-Root stehen. Alternativ lassen sich die Skripte direkt per Pfad ausführen: `python generator/synth.py ...`
 
-## 2 Testumgebung
+## Konfiguration
 
-### 2.1 Hardware und Betriebssystem
-- Gerät: Raspberry Pi 5 (aarch64)
-- OS: Debian 12 (bookworm)
-- Kernel: 6.12.34+rpt-rpi-2712
-- Storage: externe SSD via USB (UASP aktiv), ext4, Mount mit `noatime`
-- PSI: Linux Pressure Stall Information ist verfügbar über `/proc/pressure/{cpu,memory,io}`
+### EDGE_ROOT
 
-### 2.2 Messstabilisierung
-- Messungen erfolgen im Leerlauf ohne interaktive Last
-- Optionale Fixierung der CPU-Frequenz bzw. Protokollierung von Frequenz und Temperatur pro Iteration
-- Wiederholungen und robuste Aggregation (Median, p95) zur Reduktion von Ausreißereinfluss
+Das Output-Verzeichnis wird über die Umgebungsvariable `EDGE_ROOT` konfiguriert:
 
----
+```bash
+export EDGE_ROOT=/mnt/edgebench  # Standard
+# oder
+export EDGE_ROOT=~/edgebench     # Im Home-Verzeichnis
+```
 
-## 3 Datenbasis
+Standardmäßig: `/mnt/edgebench`
 
-### 3.1 Datenmodell (logisches Schema)
-Zeitreihendaten werden als Messpunkte modelliert:
+### Verzeichnisstruktur
 
-- `ts_ns`: Zeitstempel in Nanosekunden (Integer, monoton steigend)
-- `tag`: Sensor- oder Kanal-ID (String oder Integer-Kategorie)
-- `value`: Messwert (Float)
-- optional: `quality`, `meta`, weitere Attribute je nach Generator
+Unterhalb von `EDGE_ROOT` wird folgende Verzeichnisstruktur erwartet:
 
-### 3.2 Datengenerierung und Determinismus
-Die synthetische Datenbasis dient der kontrollierten Skalierung entlang zweier Achsen:
+```
+edgebench/
+├── data/
+│   ├── <zeitreihe>.csv
+│   └── <zeitreihe>.parquet
+├── db/
+│   ├── sqlite_<rows>x<tags>_noidx.db
+│   ├── sqlite_<rows>x<tags>_idx.db
+│   └── duck_<rows>x<tags>.db
+├── results/
+│   ├── <ergebnis>.json
+│   ├── summary_with_cis.csv
+│   └── ...
+└── logs/
+    ├── matrix_<RUN_ID>.log
+    └── ...
+```
 
-- **rows_per_tag**: Anzahl Messpunkte pro Tag
-- **tags**: Anzahl paralleler Zeitreihen
+## Quickstart
 
-Determinismus wird durch festen Seed und festen Referenzstart (`t0_ns`) hergestellt, sodass Datensätze identisch reproduziert werden können.
+1. **Daten generieren:**
 
-### 3.3 Dateiformate und Ladepfade
-- SQLite: Laden in eine DB-Datei (WAL-Konfiguration, Indexpfade optional)
-- DuckDB: Import aus Parquet oder direkter Scan (je nach Versuchsbedingung)
+   Beispiel: 100000 rows pro Tag, 20 Tags, 1 Hz, über `generator/synth` mit `rows`, `tags`, `freq-ms` und `seed`.
 
----
+   ```bash
+   python generator/synth.py --rows 100000 --tags 20 --freq-ms 1000 --seed 42
+   ```
 
-## 4 Workloads und Query-Semantik
+   Das erzeugt `syn_<rows>x<tags>.csv` und `syn_<rows>x<tags>.parquet` unter `EDGE_ROOT/data`.
 
-### 4.1 Notation und Zeitsemantik
-- Daten liegen als diskrete Samples vor, unregelmäßige Effekte können durch Jitter im Generator modelliert werden.
-- Zeitfenster werden relativ zu einer Referenzzeit `t_ref` definiert.
-- “Letzte N Minuten” bedeutet Intervall `(t_ref - N, t_ref]` in Nanosekunden, auf `ts_ns` angewandt.
+2. **DBs laden:**
 
-### 4.2 Query-Klassen
-Die Queries bilden drei typische Klassen ab:
+   - SQLite ohne Extra-Index:
 
-1. **Vorverdichtung / Downsampling**  
-   Gruppierung in Zeit-Buckets und Aggregation (z. B. Mittelwert).
+     ```bash
+     python loader/sqlite_loader.py --csv EDGE_ROOT/data/syn_100000x20.csv --db sqlite_100000x20_noidx.db
+     ```
 
-2. **Gleitende Auswertung**  
-   Aggregation über ein fixes Fenster relativ zu `t_ref` (z. B. 15 Minuten, 60 Minuten).
+   - SQLite mit Extra-Index (tag, ts_ns):
 
-3. **Fensterbasierte Kennzahlen (Tumbling Window)**  
-   Partitionierung in nicht überlappende Fenster (z. B. 10 Minuten) und Berechnung von Mittelwert und p95 pro Fenster.
+     ```bash
+     python loader/sqlite_loader.py --csv EDGE_ROOT/data/syn_100000x20.csv --db sqlite_100000x20_idx.db --extra-index
+     ```
 
----
+   - DuckDB:
 
-## 5 Query-Definitionen (kanonisch)
+     ```bash
+     python loader/duckdb_loader.py --parquet EDGE_ROOT/data/syn_100000x20.parquet --db duck_100000x20.db
+     ```
 
-Wichtig: Die folgende Spezifikation ist die “kanonische Semantik”. Die SQL-Implementierungen dürfen engine-spezifisch sein, solange die Semantik erfüllt wird.
+3. **Single-Benchmark ausführen:**
 
-### Q1 Downsample 5 Minuten (Bucket-Aggregation)
-**Zweck:** Zeitliche Vorverdichtung, typisch für Trendanzeigen und Historian-Downsampling.
+   Beispiel für SQLite:
 
-**Eingaben:**
-- Tag-Menge `T` (z. B. alle Tags oder ein Subset)
-- Zeitbereich `[t_start, t_end]`
-- Bucket-Größe `B = 5 min`
+   ```bash
+   python runner/run_bench.py --engine sqlite --db sqlite_100000x20_noidx.db --query downsample_1min --repeats 10
+   ```
 
-**Ausgabe:**
-- Pro `tag` und Bucket: `bucket_start`, `avg(value)`, optional `count`
+   Beispiel für DuckDB:
 
-**Semantik (formal):**
-- Bucket-Index `b = floor((ts_ns - t0_ns) / B_ns)`
-- Gruppierung nach `(tag, b)`
+   ```bash
+   python runner/run_bench.py --engine duckdb --db duck_100000x20.db --query downsample_1min --repeats 10 --threads 4
+   ```
 
-**Hinweis zur Performance-Erwartung:**
-- Scan-dominant, profitiert von vektorisierten Aggregationen und effizientem Group-By.
-- Indexnutzung ist typischerweise begrenzt, wenn ein großer Bereich gescannt wird.
+4. **Matrix-Runner für komplette Experimente nutzen:**
 
----
+   ```bash
+   python runner/run_matrix.py --sizes 1000,10000,100000 --tags 10,20,30 --repeats 5
+   ```
 
-### Q2 Last 15 Minuten Average (Endfenster-Aggregation)
-**Zweck:** “Letzter Zustand” oder kurzfristige Glättung je Tag.
+5. **Ergebnisse auswerten:**
 
-**Eingaben:**
-- `t_ref`
-- Fenster `W = 15 min`
+   ```bash
+   python analysis/summarize_results.py
+   ```
 
-**Ausgabe:**
-- Pro Tag: `avg(value)` über `(t_ref - W, t_ref]`
+## Komponenten im Detail
 
-**Semantik (formal):**
-Für jedes `tag` gilt:
-- `AVG_{tag,15m} = mean({ value | tag = tag_i AND ts_ns in (t_ref-W, t_ref] })`
+- **Generator:** Erzeugt synthetische Zeitreihen mit `ts_ns` in Nanosekunden in gleichmäßigem Schritt (`freq-ms`), pro Tag eine sinus-basierte Kurve plus reproduzierbares Rauschen über `--seed` und schreibt CSV sowie Parquet. Mit `--t0-ns` lässt sich ein fixer Startzeitpunkt setzen, um die gleiche Zeitachse über Runs zu erhalten.
 
-**Hinweis zur Performance-Erwartung:**
-- Selektiv, häufig indexfreundlich (Index auf `(tag, ts_ns)`).
-- SQLite kann hier über Indexpfade stark profitieren.
+- **SQLite-Loader:** Schreibt in eine `measurements`-Tabelle mit Primärschlüssel `(ts_ns, tag)` und `WITHOUT ROWID` und setzt PRAGMAs wie WAL und `synchronous=NORMAL` sowie weitere Einstellungen (z. B. `page_size`, `cache_size`, `mmap_size`, `temp_store=MEMORY`). Optional kann ein zusätzlicher Index über `(tag, ts_ns)` erstellt werden.
 
----
+- **DuckDB-Loader:** Materialisiert `measurements` aus Parquet, optional sortiert, und führt anschließend einen `CHECKPOINT` aus.
 
-### Q3 Last 60 Minuten Average (Endfenster-Aggregation)
-Wie Q2, aber `W = 60 min`.  
-Erwartung: Mehr Daten im Fenster, daher höherer Scananteil, Indexvorteil kann abnehmen.
+- **Single-Runner (`run_bench`):** Misst eine Query mehrfach und schreibt eine JSON-Datei nach `results/`. Wesentliche Parameter sind `engine` (sqlite oder duckdb), `db` (Pfad), `query` (Name; SQL wird aus `queries/<engine>/<query>.sql` geladen), `repeats`, `warm`, `threads` (nur DuckDB), `drop-caches` (root nötig), `max-run-s` (Zeitbudget, bricht ggf. früh ab) sowie `parquet/csv` als File-Scan-Helper für DuckDB. Die Output-Dateien werden nach dem Schema `<dbstem>_<engine>_<query>_<warm|cold>[_t{threads}]_{tbl|fs}.json` benannt.
 
----
+- **Matrix-Runner (`run_matrix`):** Generiert Datensätze, baut DBs (SQLite idx/noidx und DuckDB), plant Query-Läufe (warm/cold; DuckDB auto/t1; optional file-scan), randomisiert die Reihenfolge und schreibt Logs und Manifeste, typischerweise `progress.ndjson` und `failures.ndjson` in `results` sowie `manifest.json` und `manifests/<RUN_ID>.json`, plus `logs/matrix_<RUN_ID>.log`.
 
-### Q4 Tumbling 10 Minuten: Mean und p95 (Fenster-Report)
-**Zweck:** Periodisches Reporting mit robusten Kennzahlen je Zeitfenster.
+## Queries
 
-**Eingaben:**
-- Zeitbereich `[t_start, t_end]`
-- Fenstergröße `B = 10 min`
+Queries liegen engine-spezifisch als Dateien unter `queries/sqlite/<name>.sql` und `queries/duckdb/<name>.sql`. Übliche Query-Namen sind `downsample_1min`, `downsample_5min`, `downsample_15min`, `last_15min_avg`, `last_60min_avg` und `window_10min_mean_p95`. DuckDB-Queries können optional Platzhalter `{PARQUET}` oder `{CSV}` nutzen.
 
-**Ausgabe:**
-- Pro Tag und Fenster: `bucket_start`, `mean(value)`, `p95(value)`
+## Analysis
 
-**Semantik (Bucket):**
-- Bucket wie in Q1, aber `B = 10 min`
+Die Analysis-Komponente (`analysis/summarize_results.py`) liest `results/*.json` und erzeugt u. a. `summary_with_cis.csv`, `iterations_long.csv`, `break_even.csv`, `break_even_multi.csv` sowie `run_summary.json` in `results/`.
 
-**p95-Definition (diskret):**
-- Für ein Fenster mit `n` Werten, sortiert aufsteigend `x[0..n-1]`
-- Diskretes p95: `x[k]` mit `k = ceil(0.95 * n) - 1`, gekappt auf `[0, n-1]`
+## Output-Formate
 
-**Hinweis zur Engine-Ausrichtung:**
-- DuckDB bietet Perzentilfunktionen, die je nach Funktion und Default-Interpolation anders sein können.
-- Für Fairness muss in beiden Engines dieselbe diskrete Definition umgesetzt werden.
+- `run_bench` schreibt pro Run eine JSON-Datei mit Metadaten (engine, db, query, repeats, warm, threads, drop_caches), Messwerten (durations_ns und aggregierte stats wie p50/p95/p99/mean/min/max in ms), Iterations-Metadaten (PSI before/after, Temperatur/Frequenz, RSS/CPU, Timestamps), Versionsinfos (Python, DuckDB/SQLite, pandas/numpy/pyarrow, optional git_rev) sowie zusätzlichen Feldern wie db_filesize_bytes, dataset_meta, scan_mode und truncated.
 
----
+## Cold vs Warm
 
-## 6 Messablauf
+- **warm** aktiviert typischerweise DuckDB object cache und optionales Warmup.
+- **drop-caches** vor jeder Iteration den Linux Page Cache droppt und damit ein härteres Cold-Setup abbildet (root nötig).
 
-### 6.1 Experimentzelle und Faktoren
-Eine Messzelle ist durch folgende Parameter eindeutig definiert:
+## Queries hinzufügen
 
-- Engine: SQLite oder DuckDB
-- Workload: Q1–Q4
-- Datenmaß: `rows_per_tag` und `tags` (oder Gesamtzeilen, aber Achse muss klar dokumentiert sein)
-- Cache-Regime: warm oder cold
-- Threads: z. B. `t1` oder `auto` (DuckDB)
-- Indexprofil (SQLite): z. B. Basisindex vs zusätzlicher `(tag, ts_ns)` Index
-- RAM-Profil: Baseline oder Cap (falls cgroup-Limit aktiv)
-- Ladepfad: DuckDB Import vs File-Scan (falls getestet)
+Lege für jede Engine eine Datei unter `queries/sqlite/<name>.sql` und `queries/duckdb/<name>.sql` an und führe anschließend `run_bench` für sqlite und duckdb mit dem jeweiligen Query-Namen aus, um die Messung zu erzeugen.
 
-### 6.2 Wiederholungen und Iterationen
-- Pro Messzelle werden `R` Runs durchgeführt (z. B. 20)
-- Pro Run werden `I` Iterationen gemessen (z. B. 10)
-- Pro Iteration: Query ausführen, Latenz messen, Systemmetriken sampeln
+## Troubleshooting
 
-Robuste Kennzahlen werden pro Run aus den `I` Iterationen berechnet und anschließend über Runs aggregiert.
+- **Permission denied bei drop-caches:** Root-Rechte fehlen, `sudo -E` benötigt.
+- **Fehlende Query-Datei:** Prüfe `queries/<engine>/<query>.sql`.
+- **DuckDB file-scan “no such table measurements”:** Nutze `{PARQUET}/{CSV}` im SQL oder übergib `--parquet/--csv`, damit `run_bench` eine TEMP VIEW `measurements` erstellen kann.
+- **Fehlende PSI:** `/proc/pressure/*` existiert nicht, der Run ist trotzdem möglich, nur ohne PSI.
+- **python -m funktioniert nicht:** Fehlende `__init__.py` Dateien oder nicht im Repo-Root, dann starte per Skriptpfad.
 
-### 6.3 Warm vs Cold (operativ)
-**Warm:**
-- Vor dem Run wird ein definierter “Warm-up” durchgeführt (z. B. 1–3 Ausführungen), die nicht in die Messung eingehen.
-- Danach werden Iterationen ohne Cache-Drops gemessen.
+## Lizenz
 
-**Cold:**
-- Vor jeder Iteration wird der Cachezustand zurückgesetzt (oder blockweise vor einem Iterationsblock, wenn so definiert).
-- Der Reset wird dokumentiert, und die Messung startet erst nach Abschluss des Drops.
+License: Proprietary (All rights reserved). No use, copying, modification, or distribution without permission.
 
-Wichtig: “Cold” muss als konkrete Prozedur dokumentiert sein, sonst sind Ergebnisse nicht vergleichbar.
 
----
+Copyright (c) 2026 Christian Dederer
 
-## 7 Kennzahlen und Aggregation
+All rights reserved.
 
-### 7.1 Latenz pro Iteration
-- Gemessen wird die wall-clock Zeit der Query-Ausführung in Millisekunden.
-- Pro Iteration entsteht ein Wert `lat_ms`.
+No permission is granted to use, copy, modify, merge, publish, distribute, sublicense,
+or sell copies of this software or its associated documentation, in whole or in part,
+without prior written permission from the copyright holder.
 
-### 7.2 Per-Run Statistiken
-Aus den `I` Iterationen eines Runs:
-- `p50` = Median der `lat_ms`
-- `p95` = 95. Perzentil der `lat_ms` (diskret)
-- optional: `p99`, `min`, `max`
 
-### 7.3 Aggregation über Runs
-Über `R` Runs wird robust zusammengefasst:
-- Reported `p50` = Median der Run-`p50`
-- Reported `p95` = Median der Run-`p95`
-- Zusätzlich: Streuung (IQR oder Bootstrap-Konfidenzbänder)
-
-### 7.4 Unsicherheitsabschätzung (Bootstrap)
-Zur Quantifizierung der Unsicherheit:
-- Pro Run werden aus den `I` Iterationen `B` Bootstrap-Stichproben gezogen (typisch `B = 2000`)
-- Für jede Stichprobe wird die Zielkennzahl (Median oder p95) berechnet
-- Aus der Bootstrap-Verteilung wird ein 95 Prozent Intervall `[low, high]` bestimmt
-- Über Runs hinweg werden die unteren und oberen Grenzen robust aggregiert (Median der Lows und Median der Highs)
-
-Hinweis: Bootstrap-Intervalle für hohe Perzentile bei sehr kleinen Stichproben (z. B. `I = 10`) sind primär zur Visualisierung der Streuung geeignet.
-
----
-
-## 8 Systemmetriken und PSI (inkl. Erklärung der “Deltas”)
-
-### 8.1 Was PSI liefert
-Linux PSI stellt für CPU, Memory und IO Druckwerte bereit. Die Dateien in `/proc/pressure/*` enthalten u. a.:
-- eine “some” und “full” Kategorie
-- gleitende Durchschnittswerte über feste Zeitfenster
-- kumulative Zähler (zeitbasierte Akkumulation seit Boot)
-
-### 8.2 Warum in Plots “Delta” steht
-Viele PSI-Werte sind **kumulativ**, also seit Systemstart aufaddiert. Um Belastung **pro Messintervall** sichtbar zu machen, wird pro Iteration ein Snapshot genommen und anschließend die Differenz zum vorherigen Snapshot gebildet:
-
-- `delta = psi_total_now - psi_total_prev`
-
-Interpretation:
-- `delta` ist die zusätzliche Stall-Zeit, die während der Iteration (oder während des Iterationsintervalls) aufgelaufen ist.
-- Dadurch lassen sich Iterationen vergleichen, ohne dass der absolute “seit Boot” Zähler dominiert.
-
-### 8.3 Wie PSI im Kontext gelesen wird
-- CPU-PSI hoch bei CPU-Konkurrenz oder Scheduler-Druck
-- IO-PSI hoch bei blockierendem Storage-Backpressure
-- Memory-PSI hoch bei Reclaim, Page-Fault Druck, RAM-Limits
-
-Die Deltas werden zusammen mit Temperatur und Frequenz geloggt, um Latenzsprünge mechanistisch zu erklären.
-
----
-
-## 9 Ergebnisartefakte und Reproduzierbarkeit
-
-### 9.1 Protokollierte Metadaten
-Pro Kampagne bzw. Messzelle werden gespeichert:
-- Git-Commit oder Snapshot-ID
-- Python-Version und Requirements
-- Engine-Versionen (SQLite, DuckDB)
-- Parameter der Messzelle (Tags, Rows, Cache, Threads, Indexprofil)
-- DB-Größen (Dateigröße) und ggf. Parquet-Größe
-- Laufzeit-Logs pro Iteration (Latenz, PSI-Deltas, Temperatur, Frequenz)
-
-### 9.2 Struktur der Artefakte
-Empfohlen:
-- `results/` aggregierte Kennzahlen pro Zelle (z. B. JSON oder CSV)
-- `logs/` Iterationslogs (z. B. NDJSON)
-- `_audit/` Konsistenz- und Rerun-Protokolle
-- `snapshots/` eingefrorene Umgebung (requirements, python_version, commit)
-
----
-
-## 10 Validität und Grenzen
-
-### 10.1 Interne Validität
-Risiken:
-- Unklare Cold-Prozedur oder inkonsistente Cache-Drops
-- Vermischung von Indexprofilen (z. B. falsche DB-Datei)
-- Hintergrundlast (Update-Dienste, Logging-Spikes)
-
-Gegenmaßnahmen:
-- Klare Prozeduren, Audit-Logs, feste Dateinamenkonvention, Wiederholungen und robuste Aggregation.
-
-### 10.2 Externe Validität
-Synthetische Daten ermöglichen kontrollierte Skalierung, können aber reale Eigenschaften nur approximieren:
-- Verteilung und Autokorrelation realer Sensoren
-- Missingness, Ausreißer, echte Event-Last
-
-Gegenmaßnahme:
-- Ein Real-Datensatz als Ankerpunkt im Parameterraum (zusätzlicher Validierungsbezug)
-- Diskussion, welche Effekte generalisieren und welche generatorabhängig sein können
-
----
-
-## 11 Kurzreferenz der Query-Schnittstellen (für Implementierung und Review)
-
-### Q1 Downsample 5min
-- Input: tag set, time range
-- Output: per tag per 5min bucket avg
-
-### Q2 Last 15min avg
-- Input: t_ref
-- Output: per tag avg in last 15min
-
-### Q3 Last 60min avg
-- Input: t_ref
-- Output: per tag avg in last 60min
-
-### Q4 Tumbling 10min mean + discrete p95
-- Input: time range
-- Output: per tag per 10min bucket mean and discrete p95
-
----
-
-## 12 Checkliste vor einem Kampagnenlauf
-- Datensatzparameter (rows_per_tag, tags) stimmen mit Manifest überein
-- DB-Dateien eindeutig pro Indexprofil benannt
-- Cache-Regime korrekt eingestellt und dokumentiert
-- Threads-Konfiguration korrekt gesetzt
-- Warm-up klar definiert und aus Messung ausgeschlossen
-- Logs und Ergebnisartefakte werden in neue, eindeutige Kampagnenstruktur geschrieben
-- Validierung (gleiches Ergebnis) zumindest stichprobenartig aktiv
-
----
+## Note:
+This Repo will be privated at 03/01/2026
