@@ -1,0 +1,27 @@
+=== Host ===
+pi5-edgebench
+2025-09-01T17:34:01+02:00
+=== OS ===
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+NAME="Debian GNU/Linux"
+VERSION_ID="12"
+VERSION="12 (bookworm)"
+VERSION_CODENAME=bookworm
+ID=debian
+HOME_URL="https://www.debian.org/"
+SUPPORT_URL="https://www.debian.org/support"
+BUG_REPORT_URL="https://bugs.debian.org/"
+=== Kernel ===
+Linux pi5-edgebench 6.12.34+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.34-1+rpt1~bookworm (2025-06-26) aarch64 GNU/Linux
+=== PSI enabled ===
+CONFIG_PSI=y
+CONFIG_PSI_DEFAULT_DISABLED=y
+=== Mounts ===
+NAME        TRAN ROTA   SIZE FSTYPE MODEL        MOUNTPOINT
+sda         usb     0 465.7G        Extreme 55AE 
+└─sda1              0 465.7G ext4                /mnt/edgebench
+mmcblk0             0 119.1G                     
+├─mmcblk0p1         0   512M vfat                /boot/firmware
+└─mmcblk0p2         0 118.6G ext4                /
+=== cmdline ===
+console=serial0,115200 console=tty1 root=PARTUUID=5f441224-02 rootfstype=ext4 fsck.repair=yes rootwait psi=1

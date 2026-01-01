@@ -1,0 +1,28 @@
+{
+  "engine": "sqlite",
+  "query": "downsample_15min",
+  "warm": true,
+  "threads": null,
+  "scan_mode": "table",
+  "db": "/tmp/sqlite_900x20_idx.db",
+  "durations_ns": [1000000, 1100000, 1200000],
+  "stats": {
+    "p50_ns": 1100000,
+    "p95_ns": 1200000
+  },
+  "dataset_meta": {
+    "rows": 18000,
+    "tags": 20,
+    "seed": 42,
+    "freq_ms": 1000
+  },
+  "iterations": [
+    {
+      "dur_ns": 1000000,
+      "psi_before": {"cpu": "", "io": ""},
+      "psi_after": {"cpu": "", "io": ""},
+      "rss_bytes": 12345678,
+      "cpu_percent": 10.0
+    }
+  ]
+}
